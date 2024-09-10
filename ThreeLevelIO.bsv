@@ -24,104 +24,112 @@ interface ThreeLevelIOPins;
 
     (* always_ready *)
     method Bool dbg1;
-    //(* always_ready *)
-    //method Bool dbg2;
 endinterface
 
 module mkThreeLevelIO#(Bool sync_to_line_clock)(ThreeLevelIO);
-    LBit#(CyclesPerSymbol) counter_max_value = fromInteger(valueOf(CyclesPerSymbol) - 1);
-    Reg#(LBit#(CyclesPerSymbol)) counter_reset_value <- mkReg(counter_max_value);
-    Reg#(LBit#(CyclesPerSymbol)) counter <- mkReg(counter_max_value);
+    LBit#(CyclesPerSymbol) max_counter_value = fromInteger(valueOf(CyclesPerSymbol) - 1);
+    Reg#(LBit#(CyclesPerSymbol)) reset_counter_value <- mkReg(max_counter_value);
+    Reg#(LBit#(CyclesPerSymbol)) counter <- mkReg(max_counter_value);
 
-    Reg#(Bit#(1)) txp_in <- mkReg(0);
-    Reg#(Bit#(1)) txn_in <- mkReg(0);
-    Reg#(Bool) tx_en <- mkReg(False);
-    TriState#(Bit#(1)) txp_zbuf <- mkTriState(tx_en, txp_in);
-    TriState#(Bit#(1)) txn_zbuf <- mkTriState(tx_en, txn_in);
+    Reg#(Bit#(1)) txp_reg <- mkReg(0);
+    Reg#(Bit#(1)) txn_reg <- mkReg(0);
+    Reg#(Bool) tx_enable <- mkReg(False);
+    TriState#(Bit#(1)) txp_buffer <- mkTriState(tx_enable, txp_reg);
+    TriState#(Bit#(1)) txn_buffer <- mkTriState(tx_enable, txn_reg);
 
-    FIFOF#(Symbol) fifo_tx <- mkFIFOF;
+    FIFOF#(Symbol) tx_fifo <- mkFIFOF;
 
-    Reg#(Bool) first_output_produced <- mkReg(False);
-    continuousAssert (!first_output_produced || fifo_tx.notEmpty, "E1 TX was not fed fast enough");
+    Reg#(Bool) output_produced <- mkReg(False);
+    continuousAssert(!output_produced || tx_fifo.notEmpty, "TX FIFO was not fed quickly enough");
 
-    rule produce_output;
-        let level = fifo_tx.first;
+    rule output_production;
+        let level = tx_fifo.first;
 
-        let counter_mid_value = counter_max_value >> 1;
-        if (counter < counter_mid_value)  // Return-to-zero
+        let mid_counter_value = max_counter_value >> 1;
+        if (counter < mid_counter_value)  // Return-to-zero
             level = Z;
 
         case (level)
             N:
                 action
-                    txp_in <= 0;
-                    txn_in <= 1;
-                    tx_en <= True;
+                    txp_reg <= 0;
+                    txn_reg <= 1;
+                    tx_enable <= True;
                 endaction
             Z:
                 action
-                    txp_in <= 0;
-                    txn_in <= 0;
-                    tx_en <= False;
+                    txp_reg <= 0;
+                    txn_reg <= 0;
+                    tx_enable <= False;
                 endaction
             P:
                 action
-                    txp_in <= 1;
-                    txn_in <= 0;
-                    tx_en <= True;
+                    txp_reg <= 1;
+                    txn_reg <= 0;
+                    tx_enable <= True;
                 endaction
         endcase
 
         if (counter == 0) begin
-            fifo_tx.deq;
+            tx_fifo.deq;
         end
 
-        first_output_produced <= True;
+        output_produced <= True;
     endrule
 
     Reg#(Bit#(3)) rxp_sync <- mkReg('b111);
     Reg#(Bit#(3)) rxn_sync <- mkReg('b111);
-    RWire#(Symbol) fifo_rx_w <- mkRWire;
-    FIFOF#(Symbol) fifo_rx <- mkFIFOF;
+    RWire#(Symbol) rx_fifo_wire <- mkRWire;
+    FIFOF#(Symbol) rx_fifo <- mkFIFOF;
 
-    continuousAssert(!isValid(fifo_rx_w.wget) || fifo_rx.notFull, "E1 RX was not consumed fast enough");
+    continuousAssert(!isValid(rx_fifo_wire.wget) || rx_fifo.notFull, "RX FIFO was not consumed quickly enough");
 
-    rule fifo_rx_enq (fifo_rx_w.wget matches tagged Valid .value);
-        fifo_rx.enq(value);
+    rule rx_fifo_enq (rx_fifo_wire.wget matches tagged Valid .value);
+        rx_fifo.enq(value);
     endrule
 
     interface ThreeLevelIOPins pins;
-        method txp = txp_zbuf.io;
-        method txn = txn_zbuf.io;
+        method txp = txp_buffer.io;
+        method txn = txn_buffer.io;
 
         method Action recv(Bit#(1) rxp_n, Bit#(1) rxn_n);
             rxp_sync <= {rxp_n, rxp_sync[2:1]};
             rxn_sync <= {rxn_n, rxn_sync[2:1]};
 
-            let sample_at_counter = sync_to_line_clock ? 0 : 17;
-            if (counter == sample_at_counter) begin
+            let sample_counter_value = sync_to_line_clock ? 0 : 17;
+            if (counter == sample_counter_value) begin
                 let value = case ({rxp_sync[1], rxn_sync[1]})
                     2'b00: Z;
                     2'b11: Z;
                     2'b01: P;
                     2'b10: N;
                 endcase;
-                fifo_rx_w.wset(value);
+                rx_fifo_wire.wset(value);
             end
 
-            counter <= counter == 0 ? counter_reset_value : counter - 1;
+            counter <= counter == 0 ? reset_counter_value : counter - 1;
 
             if (sync_to_line_clock) begin
-                let positive_edge = rxp_sync[1:0] == 'b01 || rxn_sync[1:0] == 'b01;  // {current_bit, previous_bit}
-                // TODO: preencha aqui com a sua lógica
+                let pos_edge_detected = rxp_sync[1:0] == 'b01 || rxn_sync[1:0] == 'b01;  // {current_bit, previous_bit}
+
+                // Detect positive edge
+                if (pos_edge_detected) begin
+                    let expected_counter_value = reset_counter_value >> 2;
+                    
+                    if (counter < expected_counter_value) begin
+                        reset_counter_value <= max_counter_value + 1;  // Extend cycle
+                    end else if (counter > expected_counter_value) begin
+                        reset_counter_value <= max_counter_value - 1;  // Shorten cycle
+                    end else begin
+                        reset_counter_value <= max_counter_value;  // Maintain cycle
+                    end
+                end
             end
         endmethod
 
-        method dbg1 = isValid(fifo_rx_w.wget);
-        //method dbg2 = fifo_rx.notFull;
-        //method dbg2 = !first_output_produced || fifo_tx.notEmpty;
+        method dbg1 = isValid(rx_fifo_wire.wget);
     endinterface
 
-    interface out = toGet(fifo_rx);
-    interface in = toPut(fifo_tx);
+    interface out = toGet(rx_fifo);
+    interface in = toPut(tx_fifo);
 endmodule
